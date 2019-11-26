@@ -2,11 +2,12 @@ import datetime
 import logging
 
 import six
+from sys import getsizeof
 from pymongo import errors
 from pymongo.mongo_client import MongoClient
 from pymongo.mongo_replica_set_client import MongoReplicaSetClient
 from pymongo.read_preferences import ReadPreference
-
+import gridfs
 from scrapy.exporters import BaseItemExporter
 
 
@@ -38,6 +39,8 @@ class MongoDBPipeline(BaseItemExporter):
         'buffer': None,
         'append_timestamp': False,
         'stop_on_duplicate': 0,
+        'grid_fs_threshold_bytes': None,
+        'grid_fs_field_tag': 'big_field',
     }
 
     # Item buffer
@@ -83,6 +86,7 @@ class MongoDBPipeline(BaseItemExporter):
         # Set up the database
         self.database = connection[self.config['database']]
         self.collections = {'default': self.database[self.config['collection']]}
+        self.grid_fs = gridfs.GridFS(self.database)
 
         self.logger.info(u'Connected to MongoDB {0}, using "{1}"'.format(
             self.config['uri'],
@@ -145,7 +149,9 @@ class MongoDBPipeline(BaseItemExporter):
             ('unique_key', 'MONGODB_UNIQUE_KEY'),
             ('buffer', 'MONGODB_BUFFER_DATA'),
             ('append_timestamp', 'MONGODB_ADD_TIMESTAMP'),
-            ('stop_on_duplicate', 'MONGODB_STOP_ON_DUPLICATE')
+            ('stop_on_duplicate', 'MONGODB_STOP_ON_DUPLICATE'),
+            ('grid_fs_threshold_bytes', 'MONGODB_GRID_FS_THRESHOLD_BYTES'),
+            ('grid_fs_field_tag', 'MONGODB_GRID_FS_FIELD_TAG')
         ]
 
         for key, setting in options:
@@ -170,29 +176,41 @@ class MongoDBPipeline(BaseItemExporter):
         :param spider: The spider running the queries
         :returns: Item object
         """
+
+        # Filter out fields which are explictely marked MONGODB_GRID_FS_FIELD_TAG (default = 'big_field').
+        grid_fields = list(
+            dict(
+                filter(lambda x: x[1].get(self.config['grid_fs_field_tag'], False) is True, item.fields.items())
+            ).keys()
+        )
+
         item = dict(self._get_serialized_fields(item))
+
+        # If MONGODB_GRID_FS_THRESHOLD_BYTES is set: 
+        # Find the values where the item's measured size is greater than the max size (in bytes).
+        if self.config['grid_fs_threshold_bytes'] is not None:
+            max_size_bytes = self.config['grid_fs_threshold_bytes']
+            oversized = list(
+                dict(
+                    filter(lambda x: getsizeof(x[1]) > max_size_bytes, item.items())
+                ).keys()
+            )
+            grid_fields += oversized
 
         item = dict((k, v) for k, v in six.iteritems(item) if v is not None and v != "")
 
         if self.config['buffer']:
             self.current_item += 1
-
-            if self.config['append_timestamp']:
-                item['scrapy-mongodb'] = {'ts': datetime.datetime.utcnow()}
-
-            self.item_buffer.append(item)
-
+            self.item_buffer.append((item, grid_fields))
             if self.current_item == self.config['buffer']:
                 self.current_item = 0
-
                 try:
                     return self.insert_item(self.item_buffer, spider)
                 finally:
                     self.item_buffer = []
-
             return item
 
-        return self.insert_item(item, spider)
+        return self.insert_item((item, grid_fields), spider)
 
     def close_spider(self, spider):
         """Be called when the spider is closed.
@@ -204,20 +222,37 @@ class MongoDBPipeline(BaseItemExporter):
         if self.item_buffer:
             self.insert_item(self.item_buffer, spider)
 
-    def insert_item(self, item, spider):
+    def insert_item(self, item_container, spider):
         """Process the item and add it to MongoDB.
 
-        :type item: (Item object) or [(Item object)]
-        :param item: The item(s) to put into MongoDB
+        :type item: Tuple((Item object) or [(Item object)], [str])
+        :param item: The item(s) to put into MongoDB and the grid_fs field keys.
         :type spider: BaseSpider object
         :param spider: The spider running the queries
         :returns: Item object
         """
-        if not isinstance(item, list):
-            item = dict(item)
 
+        if not isinstance(item_container, list):
+            item = item_container[0]
+            grid_fields = item_container[1]
+            for key in item:
+                if key in grid_fields:
+                    file_key = self.grid_fs.put(item[key])
+                    item[key] = file_key
             if self.config['append_timestamp']:
                 item['scrapy-mongodb'] = {'ts': datetime.datetime.utcnow()}
+        else:
+            item = []
+            for ic in item_container:
+                new_item = ic[0]
+                grid_fields = ic[1]
+                for key in new_item:
+                    if key in grid_fields:
+                        file_key = self.grid_fs.put(new_item[key])
+                        new_item[key] = file_key
+                if self.config['append_timestamp']:
+                    new_item['scrapy-mongodb'] = {'ts': datetime.datetime.utcnow()}
+                item.append(new_item)
 
         collection_name, collection = self.get_collection(spider.name)
 
