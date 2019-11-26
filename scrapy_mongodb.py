@@ -237,7 +237,7 @@ class MongoDBPipeline(BaseItemExporter):
             grid_fields = item_container[1]
             for key in item:
                 if key in grid_fields:
-                    file_key = self.grid_fs.put(item[key])
+                    file_key = self.grid_fs.put(str(item[key]), encoding='utf-8')
                     item[key] = file_key
             if self.config['append_timestamp']:
                 item['scrapy-mongodb'] = {'ts': datetime.datetime.utcnow()}
@@ -248,7 +248,7 @@ class MongoDBPipeline(BaseItemExporter):
                 grid_fields = ic[1]
                 for key in new_item:
                     if key in grid_fields:
-                        file_key = self.grid_fs.put(new_item[key])
+                        file_key = self.grid_fs.put(str(new_item[key]), encoding='utf-8')
                         new_item[key] = file_key
                 if self.config['append_timestamp']:
                     new_item['scrapy-mongodb'] = {'ts': datetime.datetime.utcnow()}
